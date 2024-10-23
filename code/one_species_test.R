@@ -1,5 +1,5 @@
 # Flo Grattarola
-# 2024-10-22
+# 2024-10-04
 # Code based on https://doserlab.com/files/spoccupancy-web/articles/spacetimemodelshtml
 # For a more basic start, check: https://doserlab.com/files/spoccupancy-web/articles/modelfitting
 
@@ -32,18 +32,17 @@ V.det.covs <- st_join(acce_grids, cell1grid_effort, left = T, join = st_equals) 
 
 ################
 # to choose species, check the verbatim_name
-
-atlas_birds_CZ %>% 
-  filter(start_year==2014 & end_year==2017 & cell_grouping ==1) %>%
-  group_by(verbatim_name) %>% count() %>% arrange((n)) %>% 
-  filter(grepl('minor', verbatim_name))
+# atlas_birds_CZ %>% 
+#   filter(start_year==2014 & end_year==2017 & cell_grouping ==1) %>%
+#   group_by(verbatim_name) %>% count() %>% arrange((n)) %>% 
+#   filter(grepl('minor', verbatim_name))
 
 sp_list <- c('anas_strepera', 'ciconia_ciconia',
              'tyto_alba', 'haliaeetus_albicilla',
              'upupa_epops', 'merops_apiaster',
              'jynx_torquilla', 'dendrocopos_minor')
 
-# sp_list <- c('dendrocopos_minor')
+# sp <- 'upupa_epops'
 
 # run for all species
 for(sp in sp_list) {
@@ -67,14 +66,14 @@ for(sp in sp_list) {
   
   ## data for analysis
   y.species <- data.frame(y=species_data$presence)
-  occ.covs <- data.frame(area = matrix(species_data$area))
+  # occ.covs <- data.frame(area = matrix(species_data$area))
   det.covs <- data.frame(effort = matrix(species_data$effort),
                          acce = matrix(species_data$acc_50k))
   coords <- data.frame(X = matrix(coords.species[,1]), 
                        Y = matrix(coords.species[,2]))
   
   data.species <- list(y = y.species,
-                       occ.covs = occ.covs,
+                       # occ.covs = occ.covs,
                        det.covs = det.covs,
                        coords = coords)
   
@@ -115,7 +114,7 @@ for(sp in sp_list) {
   verbose <- TRUE
   n.report <- 100 # Report progress at every 100th batch.
   
-  ######
+  ######  ######
   # FIT MODEL
   
   out.sp.species <- spPGOcc(occ.formula = ~ 1, 
@@ -135,59 +134,60 @@ for(sp in sp_list) {
                             n.chains = n.chains)
   
   summary(out.sp.species)
-  plot(out.sp.species, 'beta', density = FALSE)
-  plot(out.sp.species, 'alpha', density = FALSE)
-  plot(out.sp.species, 'theta', density = FALSE)
+  # plot(out.sp.species, 'beta', density = FALSE)
+  # plot(out.sp.species, 'alpha', density = FALSE)
+  # plot(out.sp.species, 'theta', density = FALSE)
   
-  ######
+  ######  ######
   # Predictive check
   
   ppc.species.out <- ppcOcc(out.sp.species, fit.stat = 'freeman-tukey', group = 1)
   summary(ppc.species.out)
   
-  ppc.species.df <- data.frame(fit = ppc.species.out$fit.y,
-                               fit.rep = ppc.species.out$fit.y.rep,
-                               color = 'lightskyblue1')
-  ppc.species.df$color[ppc.species.df$fit.rep > ppc.species.df$fit] <- 'lightsalmon'
-  plot(ppc.species.df$fit, ppc.species.df$fit.rep, bg = ppc.species.df$color, pch = 21,
-       ylab = 'Fit', xlab = 'True')
-  lines(ppc.species.df$fit, ppc.species.df$fit, col = 'black')
-  
-  
-  ######
+  # ppc.species.df <- data.frame(fit = ppc.species.out$fit.y,
+  #                              fit.rep = ppc.species.out$fit.y.rep,
+  #                              color = 'lightskyblue1')
+  # ppc.species.df$color[ppc.species.df$fit.rep > ppc.species.df$fit] <- 'lightsalmon'
+  # plot(ppc.species.df$fit, ppc.species.df$fit.rep, bg = ppc.species.df$color, pch = 21,
+  #      ylab = 'Fit', xlab = 'True')
+  # lines(ppc.species.df$fit, ppc.species.df$fit, col = 'black')
+
+  ######  ######
   # Predictions
   
-  # prediction: occupancy
-  
-  area.pred <- cell1grid_coords$area
+  # area.pred <- cell1grid_coords$area
   # X.0 <- cbind(1, area.pred) # with area
-  X.0 <- matrix(cbind(1, area.pred)[,1]) # without area
-  # X.0 <- array(1, dim = nrow(species_data))
-  coords.0 <- as.matrix(cell1grid_coords[, c('X', 'Y')])
+  # X.0 <- matrix(1, nrow(species_data), 1)
+  X.0 <- matrix(1, nrow(cell1grid_coords), 1)
   
+  coords.0 <- as.matrix(cell1grid_coords[, c('X', 'Y')]) # some unsampled grids
+  # coords.0 <- coords.species
+  
+  acce.pred <- (V.det.covs$acce - mean(V.det.covs$acce)) / sd(V.det.covs$acce)
+  effort.pred <- (V.det.covs$effort - mean(V.det.covs$effort, na.rm=T)) / sd(V.det.covs$effort, na.rm=T)
+  V.0 <- cbind(1,effort.pred, acce.pred)
+  
+  # prediction: occupancy
   out.sp.species.pred.occ <- predict(out.sp.species, X.0, coords.0, 
                                      verbose = FALSE, 
                                      type='occupancy')
   
-  plot.sp.dat.occ <- data.frame(x = cell1grid_coords$X,
-                                y = cell1grid_coords$Y, 
-                                mean.psi = apply(out.sp.species.pred.occ$psi.0.samples, 2, mean),
-                                sd.psi = apply(out.sp.species.pred.occ$psi.0.samples, 2, sd))
-  dat.sp.occ.sf <- st_as_sf(plot.sp.dat.occ, coords = c('x', 'y'), crs=4326)
-  
   # prediction: detection
-  acce.pred <- (V.det.covs$acce - mean(V.det.covs$acce)) / sd(V.det.covs$acce)
-  effort.pred <- (V.det.covs$effort - mean(V.det.covs$effort, na.rm=T)) / sd(V.det.covs$effort, na.rm=T)
-  V.0 <- (cbind(1,effort.pred, acce.pred))
-  out.sp.species.pred.det <- predict(out.sp.species, V.0, coords.0, verbose = FALSE,
+  out.sp.species.pred.det <- predict(out.sp.species, V.0, coords.0, 
+                                     verbose = FALSE,
                                      type = 'detection')
   
-  # Produce a species distribution map (posterior predictive means of detection)
-  plot.sp.dat.det <- data.frame(x = cell1grid_coords$X,
-                                y = cell1grid_coords$Y, 
-                                mean.p = apply(out.sp.species.pred.det$p.0.samples, 2, mean, na.rm = TRUE),
-                                sd.p = apply(out.sp.species.pred.det$p.0.samples, 2, sd, na.rm = TRUE))
-  dat.sp.det.sf <- st_as_sf(plot.sp.dat.det, coords = c('x', 'y'), crs=4326)
+  # Produce a species distribution map
+  dat.sp <- data.frame(x = cell1grid_coords$X,
+                       y = cell1grid_coords$Y, 
+                       mean.psi = apply(out.sp.species.pred.occ$psi.0.samples, 2, mean),
+                       sd.psi = apply(out.sp.species.pred.occ$psi.0.samples, 2, sd),
+                       mean.w = apply(out.sp.species.pred.occ$w.0.samples, 2, mean),
+                       sd.w = apply(out.sp.species.pred.occ$w.0.samples, 2, sd),
+                       mean.p = apply(out.sp.species.pred.det$p.0.samples, 2, mean, na.rm = TRUE),
+                       sd.p = apply(out.sp.species.pred.det$p.0.samples, 2, sd, na.rm = TRUE))
+  
+  dat.sp.sf <- st_as_sf(dat.sp, coords = c('x', 'y'), crs=4326)
   
   sp_name <- str_to_sentence(str_replace(sp, '_', ' '))
   raw.occ <- round(sum(species_data$presence) / nrow(species_data),2)
@@ -195,40 +195,35 @@ for(sp in sp_list) {
   beta.occ <- round(plogis(mean(out.sp.species$beta.samples)),3)
   
   plot_psi <- ggplot() + 
-    geom_sf(data = st_join(cell1grid,dat.sp.occ.sf), aes(fill = mean.psi)) +
+    geom_sf(data = st_join(cell1grid,dat.sp.sf), aes(fill = mean.psi)) +
     scale_fill_viridis_c(na.value = 'transparent') +
-    # scale_fill_fermenter(palette ='YlOrBr', n.breaks=7, direction = 1)+
-    labs(title= str_glue('{sp_name} \u03A8 (occupancy, \u03B2 = {beta.occ})')) +
+    labs(title= str_glue('{sp_name} \u03A8 (occupancy / \u03B2 = {beta.occ})')) +
     theme_bw()
   
   plot_p <- ggplot() + 
-    geom_sf(data = st_join(cell1grid,dat.sp.det.sf), aes(fill = mean.p)) +
+    geom_sf(data = st_join(cell1grid,dat.sp.sf), aes(fill = mean.p)) +
     scale_fill_viridis_c(na.value = 'transparent') +
-    # scale_fill_fermenter(palette ='YlOrBr', n.breaks=7, direction = 1)+
-    labs(title= str_glue('{sp_name} p (detection, \u03B1 = {alpha.det})' )) +
+    labs(title= str_glue('{sp_name} p (detection / \u03B1 = {alpha.det})' )) +
     theme_bw()
   
   plot_y <- ggplot() + 
-    geom_sf(data = left_join(cell1grid_effort, species_data), aes(fill = presence)) +
+    geom_sf(data = left_join(cell1grid_effort, species_data), 
+            aes(fill = presence)) +
     scale_fill_viridis_c(na.value = 'transparent') +
-    # scale_fill_brewer(palette ='Set1')+
     labs(title= str_glue('{sp_name} presence/absence (occ % = {raw.occ})' )) +
     theme_bw()
   
   plot_effort <- ggplot() + 
     geom_sf(data = cell1grid_effort, aes(fill = log(effort))) +
     scale_fill_viridis_c(na.value = 'transparent') +
-    # scale_fill_fermenter(palette ='YlGnBu', n.breaks=7, direction = 1)+
     labs(title= 'Sampling effort') +
     theme_bw()
   
   plot_acce <- ggplot() + 
     geom_sf(data = acce_grids, aes(fill = log(acc_50k))) +
     scale_fill_viridis_c(na.value = 'transparent') +
-    # scale_fill_fermenter(palette ='YlOrBr', n.breaks=7, direction = 1)+
     labs(title= 'Accessibility to cities') +
     theme_bw()
-  
   
   (plot_y | plot_effort | plot_acce)/ (plot_psi | plot_p) 
   ggsave(filename = str_glue('docs/figs/{sp}_occ.png'), width = 18, height = 10)
