@@ -49,4 +49,3 @@ po/*~
 rsconnect/
 .DS_Store
 code/_draft
-!docs/figs/*
