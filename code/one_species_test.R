@@ -32,17 +32,19 @@ V.det.covs <- st_join(acce_grids, cell1grid_effort, left = T, join = st_equals) 
 
 ################
 # to choose species, check the verbatim_name
-# atlas_birds_CZ %>% 
-#   filter(start_year==2014 & end_year==2017 & cell_grouping ==1) %>%
-#   group_by(verbatim_name) %>% count() %>% arrange((n)) %>% 
-#   filter(grepl('minor', verbatim_name))
+atlas_birds_CZ %>%
+  filter(start_year==2014 & end_year==2017 & cell_grouping ==1) %>%
+  group_by(verbatim_name) %>% count() %>% arrange((n)) %>%
+  filter(grepl('mega', verbatim_name))
 
 sp_list <- c('anas_strepera', 'ciconia_ciconia',
              'tyto_alba', 'haliaeetus_albicilla',
              'upupa_epops', 'merops_apiaster',
-             'jynx_torquilla', 'dendrocopos_minor')
-
-# sp <- 'upupa_epops'
+             'jynx_torquilla', 'dendrocopos_minor',
+             'larus_ridibundus', 'charadrius_dubius',
+             'tetrastes_bonasia', 'streptopelia_turtur',
+             'pyrrhula_pyrrhula', 'oriolus_oriolus',
+             'luscinia_megarhynchos')
 
 # run for all species
 for(sp in sp_list) {
@@ -57,7 +59,8 @@ for(sp in sp_list) {
     janitor::clean_names() %>% 
     select(presence=all_of(sp),   
            cell_label, effort, area) %>% 
-    left_join(., acce_grids)
+    left_join(., acce_grids) %>% 
+    arrange(cell_label)
   
   coords.species <- right_join(cell1grid %>% select(cell_label, area), 
                                species_data) %>%
