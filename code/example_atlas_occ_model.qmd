@@ -1,0 +1,769 @@
+---
+title: 'Atlas data occupancy models'
+subtitle: 'Examples with *Upupa epops* and *Haliaeetus albicilla* and all species'
+format: 
+  html:
+    toc: true
+    toc-location: right
+    smooth-scroll: true
+    html-math-method: katex
+    code-fold: true
+self-contained: true
+editor: source
+author: 'Florencia Grattarola'
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+editor_options: 
+  chunk_output_type: console
+---
+
+::: {.callout-note appearance="simple"}
+This code is based on <https://doserlab.com/files/spoccupancy-web/articles/spacetimemodelshtml>. 
+For a more basic start, check <https://doserlab.com/files/spoccupancy-web/articles/modelfitting>.
+:::
+
+
+```{r}
+#| label: libraries
+#| echo: true
+#| eval: true
+#| message: false
+#| warning: false
+
+library(janitor)
+library(patchwork)
+library(sf)
+sf_use_s2(FALSE)
+library(spOccupancy)
+library(tidyverse)
+```
+
+## Function to run occ models
+
+The variables' names in this function are based on our atlas data column name standards. 
+
+  - `cell_label`
+  - `cell_grouping`
+  - `effort`
+  - `area`
+
+```{r}
+#| label: occ-function
+#| echo: true
+#| eval: true
+#| message: false
+#| warning: false
+#| code-fold: false
+
+runATLASocc <- function(sp_list, 
+                        atlas_data, atlas_grid_path, atlas_grid_layer, 
+                        atlas_cell_grouping, atlas_period, acce_grids) {
+
+  out.model.fit <- list()
+  
+  ################################################
+  # ATLAS DATA PREPARATION
+  
+  atlas_grid <- sf::st_read(atlas_grid_path, layer=atlas_grid_layer, quiet = T) 
+
+  grid_coords <- atlas_grid %>% 
+    select(cell_label, area, X=cell_long, Y=cell_lat)
+    
+  grid_effort <- left_join(atlas_grid %>% select(cell_label),
+                           atlas_data %>% filter(period == atlas_period &
+                                                   cell_grouping == atlas_cell_grouping) %>%
+                             distinct(cell_label, effort, area))
+
+  # DATA FOR PREDICTIONS
+  X.0 <- matrix(1, nrow(grid_coords), 1)
+  coords.0 <- as.matrix(st_drop_geometry(grid_coords)[, c('X', 'Y')]) # some unsampled grids
+  V.det.covs <- st_join(acce_grids, grid_effort, left = T, join = st_equals) %>%
+    select(cell_label=cell_label.x, acce, effort)
+  
+  acce.pred <- (V.det.covs$acce - mean(V.det.covs$acce)) / sd(V.det.covs$acce)
+  effort.pred <- (V.det.covs$effort - mean(V.det.covs$effort, na.rm=T)) / sd(V.det.covs$effort, na.rm=T)
+  V.0 <- cbind(1, effort.pred, acce.pred)
+  
+  ################################################
+  # ANALYSIS PER SPECIES
+  
+  for(sp in sp_list) {
+    
+    i <- which(sp_list == sp)
+    
+    ################################################
+    # 1) species data preparation
+  
+    species_data <- atlas_data %>% 
+      filter(period == atlas_period & cell_grouping == atlas_cell_grouping) %>% 
+      select(cell_label, verbatim_name, effort, area) %>% 
+      mutate(presence=1) %>% 
+      pivot_wider(names_from = verbatim_name,
+                  values_from = presence,
+                  values_fill = c(list(presence=0))) %>% 
+      janitor::clean_names() %>% 
+      select(presence=all_of(sp), cell_label, effort, area) %>% 
+      left_join(., acce_grids) %>% 
+      arrange(cell_label)
+    
+    sp_coords <- right_join(atlas_grid %>% 
+                              select(cell_label, X=cell_long, Y=cell_lat), 
+                            species_data) %>% st_drop_geometry() %>% 
+      select(X, Y) %>% as.matrix() 
+    
+    ################################################
+    # 2) data for the model
+    
+    y.species <- data.frame(y=species_data$presence)
+    det.covs <- data.frame(effort = matrix(species_data$effort),
+                           acce = matrix(species_data$acce))
+    coords <- data.frame(X = matrix(sp_coords[,1]), 
+                         Y = matrix(sp_coords[,2]))
+    
+    data.species <- list(y = y.species,
+                         det.covs = det.covs,
+                         coords = coords)
+
+    dist.species <- dist(data.species$coords) # spatial component
+    cov.model <- "exponential"
+    
+    species.inits <- list(alpha = 0, 
+                          beta = 0, 
+                          z = data.species$y,  
+                          sigma.sq = 2, 
+                          phi = 3 / mean(dist.species), 
+                          w = rep(0, nrow(data.species$y)))
+    
+    batch.length <- 100
+    n.batch <- 1000
+    n.burn <- 5000
+    n.thin <- 20
+    n.chains <- 3
+    
+    species.tuning <- list(phi = 1)
+    # accept.rate = 0.43 by default, so we do not specify it.
+    
+    min.dist <- min(dist.species)
+    max.dist <- max(dist.species)
+    species.sp.priors <- list(beta.normal = list(mean = 0, var = 2.72),
+                              alpha.normal = list(mean = 0, var = 2.72),
+                              sigma.sq.ig = c(2, 1),
+                              phi.unif = c(3/max.dist, 3/min.dist))
+    
+    n.omp.threads <- 1
+    verbose <- TRUE
+    n.report <- 500 # reports progress at every 100th batch.
+    
+    ################################################
+    # 3) model fil
+    
+    out.species <- spPGOcc(occ.formula = ~ 1, 
+                           det.formula = ~ scale(effort) + scale(acce),  
+                           data = data.species, 
+                           # inits = species.inits, 
+                           n.batch = n.batch, 
+                           batch.length = batch.length, 
+                           priors = species.sp.priors, 
+                           cov.model = cov.model, 
+                           NNGP = TRUE, 
+                           n.neighbors = 5,
+                           tuning = species.tuning, 
+                           n.report = n.report, 
+                           n.burn = n.burn, 
+                           n.thin = n.thin, 
+                           n.chains = n.chains)
+    
+    ################################################
+    # 4) predictive check
+    
+    ppc.species.out <- ppcOcc(out.species, fit.stat = 'freeman-tukey', group = 1)
+    summary(ppc.species.out)
+    
+    ppc.species.df <- data.frame(fit = ppc.species.out$fit.y,
+                                 fit.rep = ppc.species.out$fit.y.rep,
+                                 color = 'lightskyblue1')
+    ppc.species.df$color[ppc.species.df$fit.rep > ppc.species.df$fit] <- 'lightsalmon'
+    plot(ppc.species.df$fit, ppc.species.df$fit.rep, bg = ppc.species.df$color, pch = 21,
+         ylab = 'Fit', xlab = 'True')
+    lines(ppc.species.df$fit, ppc.species.df$fit, col = 'black')
+    
+    ################################################
+    # 5) predictions
+    
+    # occupancy
+    pred.occ <- predict(out.species, X.0, coords.0,
+                        verbose = FALSE,
+                        type='occupancy')
+  
+    # detection 
+    pred.det <- predict(out.species, V.0, coords.0,
+                        verbose = FALSE,
+                        type = 'detection')
+    
+    ################################################
+    # 6) plots
+    
+    raw.data <- left_join(atlas_grid %>% select(cell_label), 
+           species_data %>% select(cell_label, presence, effort, acce))
+    
+    data.pred <- tibble(x = grid_coords$X,
+                        y = grid_coords$Y, 
+                        pres.abs = raw.data$presence,
+                        effort = raw.data$effort,
+                        acce = raw.data$acce,
+                        mean.psi = apply(pred.occ$psi.0.samples, 2, mean),
+                        sd.psi = apply(pred.occ$psi.0.samples, 2, sd),
+                        mean.w = apply(pred.occ$w.0.samples, 2, mean),
+                        sd.w = apply(pred.occ$w.0.samples, 2, sd),
+                        mean.p = apply(pred.det$p.0.samples, 2, mean, na.rm = TRUE),
+                        sd.p = apply(pred.det$p.0.samples, 2, sd, na.rm = TRUE))
+    
+    data.pred.sf <- st_as_sf(data.pred, coords = c('x', 'y'), crs=4326)
+    
+    params <- tibble(sp_name = str_to_sentence(str_replace(sp, '_', ' ')),
+                     raw.occ = round(sum(species_data$presence) / nrow(species_data),2),
+                     alpha.det = round(plogis(mean(out.species$alpha.samples)),3),
+                     beta.occ = round(plogis(mean(out.species$beta.samples)),3))
+    
+    out.model.fit[[i]] <- list(data.pred.sf, params)
+  }
+  return(out.model.fit)
+}
+```
+
+## Atlas species data
+
+```{r}
+#| label: data
+#| echo: true
+#| eval: true
+#| message: false
+#| warning: false
+#| code-fold: false
+
+# crs_atlas <- 'EPSG:4156'
+atlas_data <- readRDS('data/Birds_Atlas_Czechia_beast_data.rds') %>% 
+  mutate(period = case_when(start_year==1985 & end_year==1989 ~ 1,
+                            start_year==2001 & end_year==2003 ~ 2,
+                            start_year==2014 & end_year==2017 ~ 3)) # adapt to the atlas
+
+atlas_grid_path <- 'data/Birds_Atlas_Czechia_grid.gpkg'
+
+acce_grids <- readRDS('data/acce_grids.rds') %>% rename(acce=acc_50k)
+# acce_grids_path <- 'data/acce_grids.gpkg' # to have a layer for each grid cell aggregation
+```
+
+
+## Model fit 
+
+Here's how the function works
+
+```{r}
+#| label: run-function
+#| echo: true
+#| eval: false
+#| code-fold: false
+
+runATLASocc(sp_list, atlas_data,
+            atlas_grid_path, atlas_grid_layer,
+            atlas_cell_grouping, atlas_period,
+            acce_grids)
+```
+
+**Parameters**: 
+
+  - `sp_list` = a list of species to be analysed,   
+  - `atlas_data` = the entire dataset for the atlas,  
+  - `atlas_cell_grouping` = the cell grouping value in the data (corresponds to the atlas resolution) , e.g., `atlas_cell_grouping = 1` corresponds to the highest resolution,   
+  - `atlas_grid_path` = the location where the atlas grid information is stored,   
+  - `atlas_grid_layer` = the resolution of the atlas grid we want to consider, e.g., `'cell1grid'` is the highest resolution,  
+  - `atlas_period` = the atlas period we want to analyse, e.g., `1` goes from 1985 to 1989,  
+  - `acce_grids` = the layer of accessibility values per grid cell.  
+
+## Example with *Anas strepera*
+
+
+## All species recorded in the 3 atlases
+
+```{r}
+#| label: run-example
+#| echo: true
+#| eval: true
+#| message: false
+#| warning: false
+#| code-fold: false
+
+atlas_grid_layer <- 'cell1grid'
+atlas_cell_grouping <- 1 # for now, the only possibility (constrained by acce)
+# sp_list <- c('anas_strepera', 'ciconia_ciconia',
+#              'tyto_alba', 'haliaeetus_albicilla',
+#              'upupa_epops', 'merops_apiaster',
+#              'jynx_torquilla', 'dendrocopos_minor',
+#              'larus_ridibundus', 'charadrius_dubius',
+#              'streptopelia_turtur', # 'tetrastes_bonasia', 
+#              'pyrrhula_pyrrhula', 'oriolus_oriolus',
+#              'luscinia_megarhynchos')
+
+sp_list <- atlas_data %>% 
+  group_by(verbatim_name) %>% 
+  summarise(n_periods= n_distinct(period)) %>% 
+  filter(n_periods>=3) %>% 
+  mutate(verbatim_name = str_to_lower(str_replace(verbatim_name, ' ', '_'))) %>% 
+  pull(verbatim_name)
+
+atlas_occ_period_1 <- runATLASocc(sp_list, atlas_data,
+                                  atlas_grid_path, atlas_grid_layer,
+                                  atlas_cell_grouping, atlas_period=1,
+                                  acce_grids)
+
+atlas_occ_period_2 <- runATLASocc(sp_list, atlas_data,
+                                  atlas_grid_path, atlas_grid_layer,
+                                  atlas_cell_grouping, atlas_period=2,
+                                  acce_grids)
+
+atlas_occ_period_3 <- runATLASocc(sp_list, atlas_data,
+                                  atlas_grid_path, atlas_grid_layer,
+                                  atlas_cell_grouping, atlas_period=3,
+                                  acce_grids)
+```
+
+### Plots
+
+Presence/absence data, detection variables (effort and accessibility), occupancy and detection probabilities for an example species at the first atlas period (1985-1989).  
+
+```{r}
+#| label: example-plots-occ
+#| echo: true
+#| eval: true
+#| message: false
+#| warning: false
+#| out-width: '100%'
+#| fig-width: 14
+#| fig-height: 3
+#| fig-dpi: 50
+#| fig.asp: 1
+
+i_species <- which(sp_list == 'upupa_epops')
+atlas_period <- atlas_occ_period_3
+
+data.pred <- atlas_period[[i_species]][[1]] # data.pred.sf
+sp_name <- atlas_period[[i_species]][[2]]$sp_name
+sp <- str_to_lower(str_replace(sp_name, ' ', '_'))
+raw.occ <- atlas_period[[i_species]][[2]]$raw.occ
+alpha.det <- atlas_period[[i_species]][[2]]$alpha.det
+beta.occ <- atlas_period[[i_species]][[2]]$beta.occ
+
+atlas_grid <- sf::st_read(atlas_grid_path, layer=atlas_grid_layer, quiet = T)
+predictions_example_species <- st_join(atlas_grid, data.pred) 
+
+plot_y <- ggplot() + 
+  geom_sf(data = predictions_example_species, aes(fill = pres.abs)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} pres/abs (occ % = {raw.occ})' )) +
+  theme_bw()
+
+plot_psi <- ggplot() + 
+  geom_sf(data = predictions_example_species, aes(fill = mean.psi)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} \u03A8 (occupancy / \u03B2 = {beta.occ})')) +
+  theme_bw()
+
+plot_p <- ggplot() + 
+  geom_sf(data = predictions_example_species, aes(fill = mean.p)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} p (detection / \u03B1 = {alpha.det})' )) +
+  theme_bw()
+
+plot_effort <- ggplot() + 
+  geom_sf(data = predictions_example_species, aes(fill = log(effort))) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= 'Sampling effort') +
+  theme_bw()
+
+plot_acce <- ggplot() + 
+  geom_sf(data = predictions_example_species, aes(fill = log(acce))) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= 'Accessibility to cities') +
+  theme_bw()
+
+(plot_y | plot_effort | plot_acce)/ (plot_psi | plot_p) 
+```
+
+Presence/absence data and occupancy probability for an example species at each of the atlas' periods. 
+
+```{r}
+#| label: example-plots-change
+#| echo: true
+#| eval: true
+#| message: false
+#| warning: false
+#| out-width: '100%'
+#| fig-width: 14
+#| fig-height: 3
+#| fig-dpi: 50
+#| fig.asp: 1
+
+i_species <- which(sp_list == 'haliaeetus_albicilla')
+
+data.pred.1 <- atlas_occ_period_1[[i_species]][[1]] # data.pred.sf
+data.pred.2 <- atlas_occ_period_2[[i_species]][[1]] # data.pred.sf
+data.pred.3 <- atlas_occ_period_3[[i_species]][[1]] # data.pred.sf
+
+sp_name <- atlas_occ_period_1[[i_species]][[2]]$sp_name
+sp <- str_to_lower(str_replace(sp_name, ' ', '_'))
+
+atlas_grid <- sf::st_read(atlas_grid_path, layer=atlas_grid_layer, quiet = T)
+
+predictions_i_species_1 <- st_join(atlas_grid, data.pred.1) 
+predictions_i_species_2 <- st_join(atlas_grid, data.pred.2) 
+predictions_i_species_3 <- st_join(atlas_grid, data.pred.3) 
+
+plot_psi_1 <- ggplot() + 
+  geom_sf(data = predictions_i_species_1, aes(fill = mean.psi)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} \u03A8 (1985 - 1989)')) +
+  theme_bw()
+
+plot_y_1 <- ggplot() + 
+  geom_sf(data = predictions_i_species_1, aes(fill = pres.abs)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} pres/abs' )) +
+  theme_bw()
+
+plot_psi_2 <- ggplot() + 
+  geom_sf(data = predictions_i_species_2, aes(fill = mean.psi)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} \u03A8 (2001 - 2003)')) +
+  theme_bw()
+
+plot_y_2 <- ggplot() + 
+  geom_sf(data = predictions_i_species_2, aes(fill = pres.abs)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} presence/absence' )) +
+  theme_bw()
+
+plot_psi_3 <- ggplot() + 
+  geom_sf(data = predictions_i_species_3, aes(fill = mean.psi)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} \u03A8 (2017 - 2017)')) +
+  theme_bw()
+
+plot_y_3 <- ggplot() + 
+  geom_sf(data = predictions_i_species_3, aes(fill = pres.abs)) +
+  scale_fill_viridis_c(na.value = 'transparent') +
+  labs(title= str_glue('{sp_name} presence/absence' )) +
+  theme_bw()
+
+
+(plot_y_1 | plot_psi_1)/ (plot_y_2 | plot_psi_2) / (plot_y_3 | plot_psi_3) 
+```
+
+## Species richness
+
+Species richness (based on the given `sp_list`) for each atlas period
+
+```{r}
+#| label: species-richness
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+atlas_occ_period <- list(atlas_occ_period_1,atlas_occ_period_2, atlas_occ_period_3)
+richness_atlas <- list()
+
+for(j in 1:length(atlas_occ_period)){
+  for(i in 1:length(atlas_occ_period[[j]])) {
+    if(i==1){
+      sp_name <- str_to_lower(str_replace(atlas_occ_period[[j]][[i]][[2]]$sp_name , ' ', '_'))
+      richness_atlas[[j]] <- tibble(mean.psi = atlas_occ_period[[j]][[i]][[1]]$mean.psi) %>%
+        rename(!!sp_name := mean.psi)
+    } else{
+      sp_name <- str_to_lower(str_replace(atlas_occ_period[[j]][[i]][[2]]$sp_name , ' ', '_'))
+      richness_atlas_i <- tibble(mean.psi = atlas_occ_period[[j]][[i]][[1]]$mean.psi) %>%
+        rename(!!sp_name := mean.psi)
+      richness_atlas[[j]] <- cbind(richness_atlas[[j]], richness_atlas_i)
+    }
+  }
+}
+
+# sum of occurrence probabilities per grid cell
+richness_atlas_1 <- richness_atlas[[1]] %>% rowSums()
+richness_atlas_2 <- richness_atlas[[2]] %>% rowSums()
+richness_atlas_3 <- richness_atlas[[3]] %>% rowSums()
+
+richness_atlases<- atlas_grid %>%
+  select(cell_label) %>% 
+  cbind(richness_atlas_1=richness_atlas_1,
+        richness_atlas_2=richness_atlas_2,
+        richness_atlas_3=richness_atlas_3)
+```
+
+
+```{r}
+#| label: species-richness-plots
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+sr_atlas1 <- ggplot() + 
+  geom_sf(data = richness_atlases, aes(fill = richness_atlas_1)) +
+  scale_fill_distiller(palette =  'RdPu', direction = 1) +
+  labs(title= 'Atlas 1 (1985-1989)', fill='richness') +
+  theme_bw()
+
+sr_atlas2 <- ggplot() + 
+  geom_sf(data = richness_atlases, aes(fill = richness_atlas_2)) +
+  scale_fill_distiller(palette =  'RdPu', direction = 1) +
+  labs(title= 'Atlas 2 (2001-2003)', fill='richness') +
+  theme_bw()
+
+sr_atlas3 <- ggplot() + 
+  geom_sf(data = richness_atlases, aes(fill = richness_atlas_3)) +
+  scale_fill_distiller(palette =  'RdPu', direction = 1) +
+  labs(title= 'Atlas 3 (2014-2017)', fill='richness') +
+  theme_bw()
+
+(sr_atlas1 / sr_atlas2 / sr_atlas3)
+```
+
+## Beta diversity
+
+```{r}
+#| label: beta-functions
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+
+richness_atlases
+# ratio gamma / alpha -1
+################################
+
+# atlas 1
+gamma1 <- ncol(richness_atlas[[1]])
+alpha1 <- mean(richness_atlas_1)
+beta1 <- round(gamma1/alpha1, 3)
+
+sd1 <- sd(richness_atlas_1)
+beta1.low <- round(gamma1/(alpha1+sd1), 3)
+beta1.high <- round(gamma1/(alpha1-sd1), 3) 
+
+# atlas 2
+gamma2 <- ncol(richness_atlas[[2]])
+alpha2 <- mean(richness_atlas_2)
+beta2 <- round(gamma2/alpha2, 3)
+
+sd2 <- sd(richness_atlas_2)
+beta2.low <- round(gamma2/(alpha2+sd2), 3)
+beta2.high <- round(gamma2/(alpha2-sd2), 3) 
+
+# atlas 3
+gamma3 <- ncol(richness_atlas[[3]])
+alpha3 <- mean(richness_atlas_3)
+beta3 <- round(gamma3/alpha3, 3)
+
+sd3 <- sd(richness_atlas_3)
+beta3.low <- round(gamma3/(alpha3+sd3), 3)
+beta3.high <- round(gamma3/(alpha3-sd3), 3) 
+
+
+tibble(gamma=c(gamma1, gamma2, gamma3), 
+       alpha=c(alpha1, alpha2, alpha3), 
+       sd=c(sd1, sd2, sd3), 
+       beta=c(beta1, beta2, beta3), 
+       beta.low=c(beta1.low, beta2.low, beta3.low),
+       beta.high=c(beta1.high, beta2.high, beta3.high)) %>% 
+  knitr::kable()
+
+```
+
+
+```{r}
+#| label: beta-plots
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+beta_w_atlas1 <- gamma1/richness_atlas_1
+beta_w_atlas2 <- gamma2/richness_atlas_2
+beta_w_atlas3 <- gamma3/richness_atlas_3
+
+betas_time <- tibble(beta = c(beta_w_atlas1, beta_w_atlas2, beta_w_atlas3),
+                    atlas_period = c(rep('atlas_1', length(beta_w_atlas1)),
+                             rep('atlas_2', length(beta_w_atlas2)),
+                             rep('atlas_3', length(beta_w_atlas3))))
+## betas
+betas_plot <- ggplot(betas_time, aes(x=atlas_period, y=beta, fill=time)) +
+  geom_boxplot(show.legend = F) + 
+  scale_fill_brewer(palette = 'Set2') +
+  labs(x='', y=expression(beta)) + 
+  ggpubr::theme_pubclean()
+
+betas_plot
+```
+
+## Spatial dissimilarity
+
+```{r}
+#| label: spat-diss-functions
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+library(vegan)
+
+b.jac1 <- vegdist(richness_atlas[[1]], method = 'jaccard')
+b.jac2 <- vegdist(richness_atlas[[2]], method = 'jaccard')
+b.jac3 <- vegdist(richness_atlas[[3]], method = 'jaccard')
+
+# dist
+XY <- atlas_grid %>% select(X=cell_long, Y=cell_lat)
+dist_XY <- dist(XY, method = 'euclidian')
+dist_XY <- as.matrix(dist_XY)
+
+b.jac1 %>% as.matrix() %>% as_tibble()
+
+spatial_beta <- bind_cols(dist_XY, b.jac1, b.jac2, b.jac3) 
+
+
+# XY_sf <- st_as_sf(XY, coords=c('X','Y'))
+# gridsToKeep <- XY_sf %>%
+#   pull(geom) %>%
+#   st_distance() %>%
+#   as.data.frame.table() %>%
+#   filter(Freq < units::set_units(500000, 'm')) %>% 
+#   mutate(index_keep = paste0(Var1,'-',Var2)) %>% 
+#   select(index_keep)
+
+# ####
+# # select grid closer than 200km 
+# dist_XY_200km <- dist_XY %>%
+#   as_tibble() %>% 
+#   mutate(row = row_number()) %>% 
+#   pivot_longer(-row, names_to = 'column',values_to = 'values', names_prefix = 'V') %>% 
+#   mutate(index = paste0(row,'-',column)) %>% 
+#   filter(index %in% gridsToKeep$index_keep) %>% 
+#   select(dist=values)
+# 
+# # distance decay
+# b.jac1_200km <- b.jac1 %>% as.matrix() %>% 
+#   as_tibble() %>% 
+#   mutate(row = row_number()) %>% 
+#   pivot_longer(-row, names_to = 'column',values_to = 'values', names_prefix = 'V') %>% 
+#   mutate(index = paste0(row,'-',column)) %>% 
+#   filter(index %in% gridsToKeep$index_keep) %>% 
+#   select(jac_time1=values)
+# 
+# b.jac2_200km <- b.jac2 %>% as.matrix() %>% 
+#   as_tibble() %>% 
+#   mutate(row = row_number()) %>% 
+#   pivot_longer(-row, names_to = 'column',values_to = 'values', names_prefix = 'V') %>% 
+#   mutate(index = paste0(row,'-',column)) %>% 
+#   filter(index %in% gridsToKeep$index_keep) %>% 
+#   select(jac_time2=values) 
+# 
+# b.jac3_200km <- b.jac3 %>% as.matrix() %>% 
+#   as_tibble() %>% 
+#   mutate(row = row_number()) %>% 
+#   pivot_longer(-row, names_to = 'column',values_to = 'values', names_prefix = 'V') %>% 
+#   mutate(index = paste0(row,'-',column)) %>% 
+#   filter(index %in% gridsToKeep$index_keep) %>% 
+#   select(jac_time2=values) 
+
+spatial_beta <- bind_cols(dist_XY_200km, b.jac1_200km, b.jac2_200km, b.jac3_200km) 
+
+```
+
+
+```{r}
+#| label: spat-diss-plots
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+beta_boxplot <- spatial_beta %>% 
+  rename(time1=jac_time1, time2=jac_time2) %>% 
+  mutate(dist=as.factor(round(dist/1000,0))) %>% 
+  filter(dist!=0) %>% 
+  pivot_longer(-dist, names_to = 'time',values_to = 'dissimilarity') %>% 
+  ggplot() +
+  geom_boxplot(aes(y = dissimilarity, x=dist, fill=time), alpha=0.8, outlier.shape = NA) +
+  scale_fill_manual(values = c('#e66101', '#5e3c99')) + 
+  stat_summary(fun = median, geom = 'path', linewidth=1,
+               mapping = aes(y = dissimilarity, x=dist, group=time, col=time), 
+               show.legend = F) +
+  scale_color_manual(values = c('#e66101', '#5e3c99')) + 
+  labs(x='Distance (km)', y='Beta diversity (Ružička index)', col='', fill='') +
+  theme_bw() 
+
+beta_boxplot
+
+```
+
+
+## Temporal dissimilarity
+
+```{r}
+#| label: temp-diss-functions
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+calculateBetaTemporal <- function(comm_time1, comm_time2, index='jaccard'){
+  beta.temp <- data.frame(row=numeric(), beta.temp=numeric())
+  for(i in 1:nrow(comm_time1)){
+    comm.matrix <- bind_rows(comm_time1[i,], comm_time2[i,])
+    beta.temp_i <- data.frame(row=i, beta.temp=as.numeric(vegdist(comm.matrix, index)))
+    beta.temp <- rbind(beta.temp, beta.temp_i)
+  }
+  return(beta.temp)
+}
+
+beta.temp.1.2 <- calculateBetaTemporal(richness_atlas[[1]], richness_atlas[[2]])
+beta.temp.2.3 <- calculateBetaTemporal(richness_atlas[[2]], richness_atlas[[3]])
+beta.temp.1.3 <- calculateBetaTemporal(richness_atlas[[1]], richness_atlas[[3]])
+
+beta_atlases <- atlas_grid %>%
+  select(cell_label) %>% 
+  cbind(beta.temp.1.2 %>% select(beta.1.2=beta.temp),
+        beta.temp.2.3 %>% select(beta.2.3=beta.temp),
+        beta.temp.1.3 %>% select(beta.1.3=beta.temp))
+```
+
+```{r}
+#| label: temp-diss-plot
+#| echo: true
+#| eval: false
+#| message: false
+#| warning: false
+
+beta_map_1.2 <- ggplot() + 
+  geom_sf(data = beta_atlases, aes(fill = beta.1.2)) +
+  scale_fill_distiller(palette =  'RdPu', direction = -1) +
+  labs(title= 'Atlas 1 (1985-1989) vs Atlas 2 (2001-2003)', 
+       fill='Temporal dissimilarity\n(Růžička index)') +
+  theme_bw()
+
+beta_map_2.3 <- ggplot() + 
+  geom_sf(data = beta_atlases, aes(fill = beta.2.3)) +
+  scale_fill_distiller(palette =  'RdPu', direction = -1) +
+  labs(title= 'Atlas 2 (2001-2003) vs Atlas 3 (2014-2017)', 
+       fill='Temporal dissimilarity\n(Růžička index)') +
+  theme_bw()
+
+beta_map_1.3 <- ggplot() + 
+  geom_sf(data = beta_atlases, aes(fill = beta.1.3)) +
+  scale_fill_distiller(palette =  'RdPu', direction = -1) +
+  labs(title= 'Atlas 1 (1985-1989) vs Atlas 3 (2014-2017)', 
+       fill='Temporal dissimilarity\n(Růžička index)') +
+  theme_bw()
+
+beta_map_1.2 / beta_map_2.3 / beta_map_1.3
+
+```
