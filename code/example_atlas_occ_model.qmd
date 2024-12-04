@@ -89,11 +89,54 @@ runATLASocc <- function(sp_list,
   for(sp in sp_list) {
     
     i <- which(sp_list == sp)
-    
+    sp_name <- str_to_sentence(str_replace(sp, '_', ' '))
+                               
     ################################################
     # 1) species data preparation
-  
-    species_data <- atlas_data %>% 
+
+    if(!sp_name %in% (atlas_data %>% 
+    filter(period == 1 & cell_grouping == 1) %>% 
+    distinct(verbatim_name) %>%
+    pull(verbatim_name))){
+      
+      species_data <- atlas_data %>% 
+      filter(period == atlas_period & cell_grouping == atlas_cell_grouping) %>% 
+      select(cell_label, verbatim_name, effort, area) %>% 
+      mutate(presence=1) %>% 
+      pivot_wider(names_from = verbatim_name,
+                  values_from = presence,
+                  values_fill = c(list(presence=0))) %>% 
+      janitor::clean_names() %>% mutate(presence = 0) %>% 
+      select(presence, cell_label, effort, area) %>% 
+      left_join(., acce_grids) %>% 
+      arrange(cell_label)
+      
+      raw.data <- left_join(atlas_grid %>% select(cell_label), 
+           species_data %>% select(cell_label, presence, effort, acce))
+    
+      data.pred <- tibble(x = grid_coords$X,
+                          y = grid_coords$Y, 
+                          pres.abs = raw.data$presence,
+                          effort = raw.data$effort,
+                          acce = raw.data$acce,
+                          mean.psi = 0,
+                          sd.psi = 0,
+                          mean.w = 0,
+                          sd.w = 0,
+                          mean.p = 0,
+                          sd.p = 0)
+      
+      data.pred.sf <- st_as_sf(data.pred, coords = c('x', 'y'), crs=4326)
+      
+      params <- tibble(sp_name = sp_name,
+                       raw.occ = round(sum(species_data$presence) / nrow(species_data),2),
+                       alpha.det = NA,
+                       beta.occ = NA)
+      
+      out.model.fit[[i]] <- list(data.pred.sf, params)
+      
+    } else{
+      species_data <- atlas_data %>% 
       filter(period == atlas_period & cell_grouping == atlas_cell_grouping) %>% 
       select(cell_label, verbatim_name, effort, area) %>% 
       mutate(presence=1) %>% 
@@ -134,8 +177,8 @@ runATLASocc <- function(sp_list,
                           w = rep(0, nrow(data.species$y)))
     
     batch.length <- 100
-    n.batch <- 1000
-    n.burn <- 5000
+    n.batch <- 100
+    n.burn <- 500
     n.thin <- 20
     n.chains <- 3
     
@@ -154,7 +197,7 @@ runATLASocc <- function(sp_list,
     n.report <- 500 # reports progress at every 100th batch.
     
     ################################################
-    # 3) model fil
+    # 3) model fit
     
     out.species <- spPGOcc(occ.formula = ~ 1, 
                            det.formula = ~ scale(effort) + scale(acce),  
@@ -225,6 +268,7 @@ runATLASocc <- function(sp_list,
                      beta.occ = round(plogis(mean(out.species$beta.samples)),3))
     
     out.model.fit[[i]] <- list(data.pred.sf, params)
+    }
   }
   return(out.model.fit)
 }
@@ -309,6 +353,8 @@ sp_list <- atlas_data %>%
   filter(n_periods>=3) %>% 
   mutate(verbatim_name = str_to_lower(str_replace(verbatim_name, ' ', '_'))) %>% 
   pull(verbatim_name)
+
+sp_list <- c('tetrastes_bonasia', 'streptopelia_turtur')
 
 atlas_occ_period_1 <- runATLASocc(sp_list, atlas_data,
                                   atlas_grid_path, atlas_grid_layer,
